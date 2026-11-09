@@ -1,0 +1,87 @@
+# Сборка PHP 7.4.33 для Windows (x64, Thread Safe, VC15) с официальным
+# исправлением PHP2Shell (CVE-2026-109618, CVE-2026-109619).
+#
+# Как запустить:
+#   1. Создать свой репозиторий на GitHub (можно приватный).
+#   2. Положить этот файл в .github/workflows/php74-php2shell-windows.yml.
+#   3. Actions → «PHP 7.4.33 + PHP2Shell fix» → Run workflow.
+#   4. Готовые архивы и файл с хешами — в разделе Artifacts запуска.
+#
+# Номер в шаге сборки — коммит php-windows-builder (master на 02.11.2026).
+# Можно заменить на @v1, но с закреплённым коммитом сборка воспроизводима.
+
+name: PHP 7.4.33 + PHP2Shell fix (Windows x64 TS)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PHP_TAG: php-7.4.33
+  # Официальный коммит PHP Security Team,
+  # ветка PHP-7.4-CVE-2026-109618-109619 в php/php-src
+  FIX_COMMIT: 712e60f9edfd03f0960fc4fc3c2c375f42b90aa2
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Исходники PHP 7.4.33 (официальный тег)
+        uses: actions/checkout@v5
+        with:
+          repository: php/php-src
+          ref: ${{ env.PHP_TAG }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Наложить официальное исправление и сверить с веткой PHP
+        shell: pwsh
+        run: |
+          git fetch --depth 2 origin $env:FIX_COMMIT
+          if ($LASTEXITCODE) { throw 'Не удалось получить коммит исправления' }
+          git -c user.name=ci -c user.email=ci@localhost cherry-pick $env:FIX_COMMIT
+          if ($LASTEXITCODE) { throw 'Исправление не наложилось' }
+          # Код должен совпадать с официальной веткой; отличаются только файлы версии
+          git diff --quiet $env:FIX_COMMIT HEAD -- . ':(exclude)NEWS' ':(exclude)configure.ac' ':(exclude)main/php_version.h'
+          if ($LASTEXITCODE) { throw 'Исходники отличаются от официальной ветки PHP' }
+          git log -2 --format='%H %s'
+          Select-String -Path main/php_version.h -Pattern 'PHP_VERSION "'
+
+      - name: Сборка официальным php-windows-builder (VC15, PGO)
+        uses: php/php-windows-builder/php@ba25ed9f412e6fa7933449b5a4c92238ac4514b5
+        with:
+          arch: x64
+          ts: ts
+
+      - name: Проверить состав и посчитать SHA-256
+        shell: pwsh
+        run: |
+          $out = 'build-record.txt'
+          "source: $env:PHP_TAG + $env:FIX_COMMIT"   | Set-Content $out
+          "build commit: $(git rev-parse HEAD)"     | Add-Content $out
+          "run: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID" | Add-Content $out
+          '--- archives'                            | Add-Content $out
+          Get-ChildItem artifacts -File | Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { '{0}  {1}' -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } | Add-Content $out
+          $zip = Get-ChildItem artifacts -Filter '*.zip' |
+            Where-Object { $_.Name -notmatch '(debug|devel|test)-pack|src' } | Select-Object -First 1
+          if (-not $zip) { throw 'Не найден архив с бинарниками PHP' }
+          Expand-Archive $zip.FullName -DestinationPath check -Force
+          foreach ($f in 'php7ts.dll', 'php7apache2_4.dll', 'php.exe') {
+            if (-not (Test-Path "check\$f")) { throw "В сборке нет $f" }
+          }
+          '--- binaries'                            | Add-Content $out
+          Get-ChildItem check -File -Include php7ts.dll, php7apache2_4.dll, php.exe -Recurse |
+            Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { '{0}  {1}' -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } | Add-Content $out
+          '--- php -v'                              | Add-Content $out
+          & check\php.exe -n -v | Add-Content $out
+          Get-Content $out
+
+      - name: Сохранить запись о сборке
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-record
+          path: build-record.txt
